@@ -4827,8 +4827,216 @@ int nd_psclose(int pn)
 .
 .
 .H2 "Декодирующий процесс"
+.PP
+Декодирующий процесс читает кадры в бесконечном цикле. На каждой итерации,
+сначала с помощью функции \*(CWreadframe\*P из видеопотока считываются данные,
+пока не будет декодирован один кадр. После этого считаный кадр переводится в
+цветовую схему RGB, а также создаётся его уменшенная копия, которая будет
+использоваться при сканировании.
+.PP
+Далее процесс пытается получить доступ к разделяемой памяти. Если она занята,
+то полученный кадр и его уменьшенная удаляются и процесс переходит к следующей
+итерации. Если процесс получает доступ к разделяемой памяти, он копирует в нее
+кадр и его уменьшенную копию и сообщает о завершении работы с разделяемой
+памятью.
+.PP
+В качестве первого аргумента функция основного цикла декодирующего процесса
+принимает структуру
+.sp 0.5v
+.KS
+.nf
+.in \n[PI]u
+.CW
+struct avdata {
+	AVFormatContext *s;
+	AVCodecContext *vcodecc;
+	AVFrame *frame;
+	int vstreamid;
+};
+
+.KE
+.sp 0.5v
+, в которой содержатся все необходимые для работы с видеопотоком структуры.
+Предполагается, что они инициализированы перед началом основного цикла.
+.PP
+В качестве второго и третьего аргумента принимаются структуры предназначенные
+для представления изображения в удобной для распознавания форме:
+.sp 0.5v
+.KS
+.nf
+.in \n[PI]u
+.CW
+struct nd_image {
+	int w;
+	int h;
+	enum ND_PIXELFORMAT format;
+	double *data;
+};
+.KE
+.sp 0.5v
+, где \*(CWw\*P и \*(CWh\*P \*- ширина и высота изображения соответственно,
+\*(CWformat\*P \*- формат пикселей (ARGB, RGB, Grayscale), а \*(CWdata\*P \*-
+данные изображения. Данные обоих изображений, передаваемых в функцию основного
+цикла декодирующего процесса разположены в разделяемом участке памяти и
+используются для передачи кадров сканирующему процессу.
+.PP
+Ниже приведен исходный код функции основного цикла декодирующего процесса:
+.sp 0.5v
+.KS
+.nf
+.in \n[PI]u
+.CW
+int decodeloop(struct avdata *av, struct nd_image *img,
+	struct nd_image *imgorig)
+{
+	struct playbackstate pbs;
+	AVRational tmpr;
+
+	tmpr = av->s->streams[av->vstreamid]->avg_frame_rate;
+	if (pbstateinit(&pbs, (double) tmpr.num / tmpr.den) < 0)
+		return 1;
+
+	while (1) {
+		int isdecoded;
+		uint8_t *rgbdata;
+		uint8_t *rgbdataorig;
+		int rgblinesize;
+		int rgblinesizeorig;
+		int retval;
+
+		isdecoded = 0;
+.KE
+.KS
+.nf
+.in \n[PI]u
+.CW
+
+		do {
+			if ((retval = readframe(av->s, av->vcodecc,
+				av->vstreamid, av->frame, &(isdecoded))) < 0)
+				return (-1);
+
+			if (retval > 0)
+				return 0;
+		} while (!isdecoded);
+
+		if (frametorgb(av->frame, img->w, img->h,
+			&rgbdata, &rgblinesize) < 0)
+			return (-1);
+
+		if (frametorgb(av->frame, imgorig->w, imgorig->h,
+			&rgbdataorig, &rgblinesizeorig) < 0)
+			return (-1);
+
+		if (nd_pstrylock(0)) {
+			rgbdatatoimg(rgbdata, rgblinesize, img);
+			rgbdatatoimg(rgbdataorig, rgblinesizeorig, imgorig);
+			
+			if (nd_psunlock(0) < 0) {
+				fprintf(stderr, nd_geterrormessage());
+				return (-1);
+			}
+		}
+
+		free(rgbdata);
+		free(rgbdataorig);
+	}
+
+	fprintf(stderr, "Unexpexted loop quit\n");
+	return (-1);
+}
+.KE
+.sp 0.5v
 .
 .H2 "Сканирующий процесс"
+.PP
+Сканирующий процесс загружает из памяти данные заранее обученного каскада
+Хаара, а затем устанавливает для него стандартную конфигурацию. После этого
+запускается бесконечный цикл, в котором на каждой итерации процесс ждет пока
+не освободится участок разделяемой памяти, и как только она освобождается,
+выполняет необходимые для распознавания действия. Когда сканирование кадра
+завершено, процесс сообщает о завершении работы с разделяемой памятью.
+.PP
+Основная функция сканирующего процесса принимает первыми двумя аргументами
+изображения, представленные структурой \*(CWstruct nd_image\*P. Как в случае
+с декодирующем процессом, данные этих изображений расположены в разделяемой
+памяти и через них сканирующий процесс принимает кадры. Третьим аргументом
+данная функция принимает путь к данным заранее обученного каскада Хаара. А
+Четвертый аргумент \*- это путь к директории куда следует сохранять изображения
+обнаруженный номеров.
+.PP
+Ниже приведен исходный код основной функции сканирующего процесса:
+.sp 0.5v
+.KS
+.nf
+.in \n[PI]u
+.CW
+int scanloop(struct nd_image *img, struct nd_image *imgorig,
+	const char *hcpath, const char *outputdir)
+{
+	struct hcdata hcd;
+
+	if (hc_hcascaderead(&(hcd.hc), hcpath) < 0) {
+		fprintf(stderr, nd_geterrormessage());
+		return (-1);
+	}
+
+	hc_confbuild(&(hcd.scanconf),
+		hcd.hc.ww, hcd.hc.wh, img->w, img->h,
+		0.9, 1, 1, threadcount);
+
+	while (1) {
+		struct nd_matrix3 perspmat;
+		struct hc_rect *r;
+		int rc;
+
+		if (nd_pslock(1) < 0) {
+			fprintf(stderr, nd_geterrormessage());
+			return (-1);
+		}
+
+		if (img->data == NULL)
+			return 0;
+		
+		if (getperspmat(img->w, img->h, &perspmat) < 0)
+			return (-1);
+	
+		if (nd_imgapplytransform(img, &perspmat) < 0) {
+			fprintf(stderr, nd_geterrormessage());
+			return (-1);
+		}
+
+		if (hc_imgpyramidscan(&(hcd.hc), img, &r, &rc,
+			&(hcd.scanconf)) < 0) {
+			fprintf(stderr, nd_geterrormessage());
+			return (-1);
+		}
+	
+		if (rc) {
+			printf("Detected.\n");
+			detectedtofile(img, imgorig, &perspmat,
+				r, rc, outputdir);
+			free(r);
+		}
+.KE
+.sp 0.5v
+.KS
+.nf
+.in \n[PI]u
+.CW
+
+		if (nd_psunlock(1) < 0) {
+			fprintf(stderr, nd_geterrormessage());
+			return (-1);
+		}
+	}
+
+	fprintf(stderr, "Unexpexted loop quit\n");
+	return (-1);
+}
+.KE
+.sp 0.5v
+
 .
 .
 .H1 "Заключение"
